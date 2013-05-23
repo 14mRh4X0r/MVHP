@@ -13,6 +13,9 @@ import socket
 import re
 import signal
 import sys
+import os
+import pwd
+import grp
 
 try:
     import json
@@ -25,6 +28,25 @@ from struct import pack, unpack
 
 CONFIG_PATH = "config.json"
 
+
+def drop_privileges(uid_name='nobody', gid_name='nogroup'):
+    if os.getuid() != 0:
+        # We're not root so, like, whatever dude
+        return
+
+    # Get the uid/gid from the name
+    running_uid = pwd.getpwnam(uid_name).pw_uid
+    running_gid = grp.getgrnam(gid_name).gr_gid
+
+    # Remove group privileges
+    os.setgroups([])
+
+    # Try setting the new uid/gid
+    os.setgid(running_gid)
+    os.setuid(running_uid)
+
+    # Ensure a very conservative umask
+    old_umask = os.umask(077)
 
 def pack_string(string):
     '''
@@ -47,7 +69,7 @@ def unpack_string(data):
     '''
     (l,) = unpack(">h", data[:2])
     assert len(data) >= 2 + 2 * l
-    return utf_16_be_decode(data[2:l * 2])[0]
+    return utf_16_be_decode(data[2:2 + l * 2])[0]
 
 
 class Router:
@@ -57,28 +79,28 @@ class Router:
     PATTERN = re.compile("^([^;]+);([^;]+):(\d{1,5})$")
 
     @staticmethod
-    def route(name):
+    def route(info):
         '''
         Finds the target host and port based on the handshake string.
         '''
-        host = Router.find_host(name)
+        host = info['hostname']
         target = config.hosts.get(host, None)
         if target is None:
             return None
         return (target.get("host", "localhost"), target.get("port", 25565))
 
-    @staticmethod
-    def find_host(name):
-        '''
-        Extracts the host from the handshake string.
-        '''
-        match = re.match(Router.PATTERN, name)
-        if match is None:
-            return
-        host = match.group(2)
-        if host not in config.hosts:
-            return
-        return host
+    #@staticmethod
+    #def find_host(name):
+    #    '''
+    #    Extracts the host from the handshake string.
+    #    '''
+    #    match = re.match(Router.PATTERN, name)
+    #    if match is None:
+    #        return
+    #    host = match.group(2)
+    #    if host not in config.hosts:
+    #        return
+    #    return host
 
 
 class Listener(asyncore.dispatcher):
@@ -170,24 +192,61 @@ class ClientTunnel(asynchat.async_chat):
                                             len(server.clients)-1, # Subtract one since connecting to poll server counts as a connection
                                             config.capacity))
                 elif packetId == 0x02:      # Handle handshake
-                    if len(self.ibuffer) >= 3:
-                        (l,) = unpack(">h", self.ibuffer[1:3])
-                        if len(self.ibuffer) >= 3 + l * 2:
-                            self.bind_server(unpack_string(self.ibuffer[1:]))
+                    info = self.parse_handshake_info()
+                    if info != None:
+                        self.bind_server(info)
                 else:
                     self.kick("Unexpected packet")
 
-    def bind_server(self, name):
+    def parse_handshake_info(self):
+        read_pos = 1
+        to_read_pos = read_pos + 1 + 2
+
+        if len(self.ibuffer) < to_read_pos:
+            return None
+        (proto_ver, uname_len) = unpack("!Bh", self.ibuffer[read_pos:to_read_pos])
+        read_pos = read_pos + 1
+
+        to_read_pos = to_read_pos + uname_len * 2
+        if len(self.ibuffer) < to_read_pos:
+            return None
+        uname = unpack_string(self.ibuffer[read_pos:])
+        read_pos = to_read_pos
+
+        to_read_pos = read_pos + 2
+        if len(self.ibuffer) < to_read_pos:
+            return None
+        (hname_len,) = unpack("!h", self.ibuffer[read_pos:to_read_pos])
+
+        to_read_pos = to_read_pos + hname_len * 2
+        if len(self.ibuffer) < to_read_pos:
+            return None
+        hname = unpack_string(self.ibuffer[read_pos:])
+        read_pos = to_read_pos
+
+        to_read_pos = read_pos + 4
+        if len(self.ibuffer) < to_read_pos:
+            return None
+        (port,) = unpack("!i", self.ibuffer[read_pos:to_read_pos])
+        read_pos = to_read_pos
+
+        return {'proto_ver':    proto_ver,
+                'username':     uname,
+                'hostname':     hname,
+                'port':         port}
+
+
+    def bind_server(self, info):
         '''
         Finds the target server and creates a ServerTunnel to it.
         '''
-        server = Router.route(name)
+        server = Router.route(info)
         if server is None:
             self.kick("No minecraft server exists at this address")
             return
         (host, port) = server
         self.log("Forwarding to %s:%s" % (host, port))
-        self.server = ServerTunnel(host, port, self, name)
+        self.server = ServerTunnel(host, port, self, info)
         self.bound = True
 
     def kick(self, reason):
@@ -249,7 +308,8 @@ class ServerTunnel(asynchat.async_chat):
         '''
         Repeats the handshake packet for the actual server
         '''
-        self.push(pack(">B", 0x02) + pack_string(self.handshake_msg))
+        #self.push(pack(">B", 0x02) + pack_string(self.handshake_msg))
+        self.push(self.client.ibuffer)
 
     def handle_close(self):
         '''
@@ -345,18 +405,19 @@ if __name__ == "__main__":
         print "Invalid configuration file:"
         print e
         sys.exit(1)
-    
+
     try:
         signal.signal(signal.SIGHUP, refresh)
     except Exception as e:
         print "NOTICE: SIGHUP not supported on your OS"
-    
+
     try:
         signal.signal(signal.SIGINFO, info)
     except Exception as e:
         print "NOTICE: SIGINFO not supported on your OS"
-    
+
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    server = Listener('0.0.0.0', 25565)
+    server = Listener('0.0.0.0', 443)
+    drop_privileges('willem', 'willem')
     Listener.loop()
