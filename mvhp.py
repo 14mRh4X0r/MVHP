@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 # This program is free software. It comes without any warranty, to
@@ -16,6 +16,7 @@ import sys
 import os
 import pwd
 import grp
+import io
 
 try:
     import json
@@ -60,6 +61,26 @@ def pack_string(string):
             utf_16_be_encode(string, "replace")[0])
 
 
+def varint_from_string(string):
+    data = io.BytesIO(string)
+    num = 0
+    byte = ord(data.read(1))
+    read = 1
+    while byte & 0x80 > 0:
+        num += (byte & 0x7F) << (7 * (read - 1))
+        byte = ord(data.read(1))
+        read += 1
+    num += byte << (7 * (read - 1))
+    return read, num
+
+def num_to_varint(num):
+    data = str()
+    while (num >> 7) > 0:
+        data += chr((num & 0x7F) | 0x80)
+        num = num >> 7
+    data += chr(num & 0x7F)
+    return data
+
 def unpack_string(data):
     '''
     Extracts a string from a data stream.
@@ -84,7 +105,7 @@ class Router:
         Finds the target host and port based on the handshake string.
         '''
         host = info['hostname']
-        target = config.hosts.get(host, None)
+        target = config.hosts.get(host, config.hosts.get(config.fallback_host, None))
         if target is None:
             return None
         return (target.get("host", "localhost"), target.get("port", 25565))
@@ -160,9 +181,11 @@ class ClientTunnel(asynchat.async_chat):
         self.parent = parent
         self.set_terminator(None)
         self.ibuffer = ""
+        self.ibuf_pos = 0
         self.bound = False
         self.server = None
         self.addr = "%s:%s" % addr
+        self.state = 0 # Handshake
         self.log("Incoming connection")
 
     def log(self, message):
@@ -181,22 +204,71 @@ class ClientTunnel(asynchat.async_chat):
         the static server list data to the client.
         '''
         if self.bound:
-            self.server.push(data)
+            if not self.server.connected:
+                self.ibuffer += data
+            else:
+                self.server.push(data)
         else:
+            print "received data: %r" % data
             self.ibuffer += data
-            if len(self.ibuffer) >= 1:
-                (packetId,) = unpack(">B", self.ibuffer[0])
-                if packetId == 0xfe:        # Handle server list query
-                    self.log("Received server list query")
-                    self.kick(u"%s§%s§%s" % (config.motd,
-                                            len(server.clients)-1, # Subtract one since connecting to poll server counts as a connection
-                                            config.capacity))
-                elif packetId == 0x02:      # Handle handshake
-                    info = self.parse_handshake_info()
-                    if info != None:
-                        self.bind_server(info)
+            try:
+                read, length = varint_from_string(self.ibuffer[self.ibuf_pos:])
+            except Exception as e:
+                return
+
+            if len(self.ibuffer[self.ibuf_pos + read:]) >= length:
+		self.ibuf_pos += read
+                data = self.ibuffer[self.ibuf_pos:self.ibuf_pos + length]
+                self.ibuf_pos += length
+
+                pos = 0
+                read, packetId = varint_from_string(data)
+                pos += read
+                if self.state == 0:        # Handshake
+                    read, proto_ver = varint_from_string(data[pos:])
+                    pos += read
+
+                    read, host_len = varint_from_string(data[pos:])
+                    pos += read
+                    host = data[pos:pos + host_len].decode('utf-8')
+                    pos += host_len
+
+                    port = unpack('!H', data[pos:pos + 2])
+                    pos += 2
+
+                    _, self.state = varint_from_string(data[pos:])
+
+                    if self.state == 2:
+                        self.bind_server({'proto_ver':  proto_ver,
+                                          'hostname':   host,
+                                          'port':       port})
+                    else:
+                        self.proto_ver = proto_ver
+                        self.host = host
+                elif self.state == 1:      # Handle status
+                    if packetId == 0x01:
+                        self.push(num_to_varint(len(data)) + data)
+                        return
+
+                    if packetId == 0x00:
+                        response = json.dumps({
+                                'version': {
+                                    'name':     'MVHP 14mRh4X0r',
+                                    'protocol': self.proto_ver
+                                },
+                                'players': {
+                                    'max': config.capacity,
+                                    'online': len(server.clients) - 1
+                                },
+                                'description': {
+                                    'text': config.motd +
+                                        '\nForwarding to: %s:%d' % Router.route({'hostname': self.host})
+                                }
+                        }).encode('utf-8')
+                        data = '\x00' + num_to_varint(len(response)) + response
+                        self.push(num_to_varint(len(data)) + data)
                 else:
-                    self.kick("Unexpected packet")
+                    self.kick("Unexpected state")
 
     def parse_handshake_info(self):
         read_pos = 1
@@ -253,8 +325,11 @@ class ClientTunnel(asynchat.async_chat):
         '''
         Kicks the client.
         '''
+        if self.state != 2: return
         self.log("Kicking (%s)" % reason)
-        self.push(pack(">B", 0xff) + pack_string(reason))
+        message = json.dumps({'text': reason}).encode('utf-8')
+        data = '\x40' + num_to_varint(len(message)) + message
+        self.push(num_to_varint(len(data)) + data)
         self.close()
 
     def handle_close(self):
@@ -282,6 +357,7 @@ class ServerTunnel(asynchat.async_chat):
         self.set_terminator(None)
         self.client = client
         self.handshake_msg = handshake
+        self.connected = False
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connect((host, port))
 
@@ -310,6 +386,7 @@ class ServerTunnel(asynchat.async_chat):
         '''
         #self.push(pack(">B", 0x02) + pack_string(self.handshake_msg))
         self.push(self.client.ibuffer)
+        self.connected = True
 
     def handle_close(self):
         '''
@@ -347,6 +424,7 @@ class Config:
         if not isinstance(raw_config, dict):
             raise Exception("Invalid structure")
         self.hosts = self._expand(raw_config.get("hosts", {}))
+	self.fallback_host = raw_config.get("fallback_host", next(iter(self.hosts)))
         self.capacity = raw_config.get("capacity", 0)
         self.motd = raw_config.get("motd", "Minecraft VirtualHost Proxy")
         print "Loaded %s host definitions" % len(self.hosts)
@@ -414,7 +492,11 @@ if __name__ == "__main__":
     try:
         signal.signal(signal.SIGINFO, info)
     except Exception as e:
-        print "NOTICE: SIGINFO not supported on your OS"
+        print "NOTICE: SIGINFO not supported on your OS, binding to SIGUSR1"
+        try:
+            signal.signal(signal.SIGUSR1, info)
+        except:
+            print "NOTICE: SIGUSR1 not supported on your OS either."
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
