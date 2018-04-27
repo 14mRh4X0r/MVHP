@@ -10,6 +10,7 @@
 import asyncore
 import asynchat
 import socket
+import errno
 import re
 import signal
 import sys
@@ -210,7 +211,6 @@ class ClientTunnel(asynchat.async_chat):
             else:
                 self.server.push(data)
         else:
-            print "received data: %r" % data
             self.ibuffer += data
             try:
                 read, length = varint_from_string(self.ibuffer[self.ibuf_pos:])
@@ -329,7 +329,7 @@ class ClientTunnel(asynchat.async_chat):
         if self.state != 2: return
         self.log("Kicking (%s)" % reason)
         message = json.dumps({'text': reason}).encode('utf-8')
-        data = '\x40' + num_to_varint(len(message)) + message
+        data = '\0' + num_to_varint(len(message)) + message
         self.push(num_to_varint(len(data)) + data)
         self.close()
 
@@ -359,8 +359,9 @@ class ServerTunnel(asynchat.async_chat):
         self.client = client
         self.handshake_msg = handshake
         self.connected = False
+        self.addr = (host, port)
         self.create_socket(socket.AF_INET6, socket.SOCK_STREAM)
-        self.connect((host, port))
+        self.connect(self.addr)
 
     def log(self, message):
         '''
@@ -373,9 +374,17 @@ class ServerTunnel(asynchat.async_chat):
         Handles socket errors
         '''
         try:
-            err = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            if err == 61:
+            err = sys.exc_info()[1].args[0]
+            #err = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err == errno.EHOSTUNREACH:
                 self.client.kick("Server unreachable")
+                return
+            elif err == errno.ECONNREFUSED and self.socket.family == socket.AF_INET6:
+                # IPv6 connection was refused, try IPv4
+                self.log('Retrying connection to %r on IPv4' % (self.addr,))
+                self.close()
+                self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.connect(self.addr)
                 return
         except:
             pass
