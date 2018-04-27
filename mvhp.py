@@ -131,11 +131,12 @@ class Listener(asyncore.dispatcher):
     def __init__(self, host, port):
         asyncore.dispatcher.__init__(self)
         self.clients = []
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.create_socket(socket.AF_INET6, socket.SOCK_STREAM)
         self.set_reuse_addr()
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         self.bind((host, port))
         self.listen(5)
-        print "Listening for connections on %s:%s" % (host, port)
+        print "Listening for connections on [%s]:%s" % self.socket.getsockname()[:2]
 
     def handle_accept(self):
         '''
@@ -184,7 +185,7 @@ class ClientTunnel(asynchat.async_chat):
         self.ibuf_pos = 0
         self.bound = False
         self.server = None
-        self.addr = "%s:%s" % addr
+        self.addr = addr
         self.state = 0 # Handshake
         self.log("Incoming connection")
 
@@ -358,7 +359,7 @@ class ServerTunnel(asynchat.async_chat):
         self.client = client
         self.handshake_msg = handshake
         self.connected = False
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.create_socket(socket.AF_INET6, socket.SOCK_STREAM)
         self.connect((host, port))
 
     def log(self, message):
@@ -500,6 +501,6 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    server = Listener('0.0.0.0', 443)
+    server = Listener('::', 443)
     drop_privileges('willem', 'willem')
     Listener.loop()
