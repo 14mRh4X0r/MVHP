@@ -42,8 +42,6 @@ Sample configuration:
 The configuration can be reloaded without restarting the proxy or disconnecting any clients simply by sending a [SIGHUP](http://en.wikipedia.org/wiki/SIGHUP#Modern_usage) signal to the process.
 
 ## License
-This program is free software. It comes without any warranty, to
-the extent permitted by applicable law. You can redistribute it
-and/or modify it under the terms of the Do What The Fuck You Want
-To Public License, Version 2, as published by Sam Hocevar. See
-[http://sam.zoy.org/wtfpl/COPYING](http://sam.zoy.org/wtfpl/COPYING) for more details.
+This software was originally released under the [Do What The Fuck You Want To
+Public License](http://www.wtfpl.net/), but has been relicensed to the [European
+Union Public License](https://joinup.ec.europa.eu/software/page/eupl).
